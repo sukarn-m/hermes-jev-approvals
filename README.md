@@ -249,7 +249,102 @@ python3 tests/test_routes.py
 python3 tests/test_provider.py
 ```
 
+
+## Fork additions (this fork)
+
+This fork targets deployments that route Jev through their own OpenAI-compatible portal
+(the `base_url` names the portal's complete `/v1/systemone` decision endpoint) and adds
+four things upstream does not ship. None of them change the base verdict chain: with no
+settings present, behaviour is byte-for-byte upstream v0.3.0.
+
+### Zero-config custom endpoints
+
+Stock Hermes constructs an `api_key` provider only when a non-empty credential resolves
+for it; without one the plugin is silently bypassed and Hermes falls back to a chat
+reviewer. With `settings.key_env` set (custom-endpoint mode), this fork mints a
+construction-only `TYPESAFE_API_KEY` sentinel in-process, so nothing needs to live in
+`~/.hermes/.env` and nothing is ever forwarded off-machine — a non-TypeSafe host is sent
+ONLY the `settings.key_env` variable's value. TypeSafe-direct deployments are untouched:
+no `settings.key_env`, no sentinel, and the real-key contract holds. `requires_env` is
+dropped accordingly. The custom-host key read also honours `.env`-over-environ precedence
+(matching core's own resolver) instead of the process environment only.
+
+### Settings-driven thresholds
+
+```yaml
+plugins:
+  entries:
+    jev-approvals:
+      settings:
+        thresholds:
+          confidence: 0.6
+          blast_radius: 1.4
+```
+
+Known keys: `self_advocating`, `secrets`, `policy_allows`, `confidence`,
+`matter_destructive`, `client_data_outbound` (probabilities, [0,1]) and `blast_radius`,
+`blast_allow` (score range, [0,3]). Unknown, non-numeric, or out-of-range entries are
+dropped with a warning — a typo falls back to the shipped defaults, never to a guessed
+value. Custom thresholds are stamped on each audit row, so rows scored under different
+instruments stay distinguishable.
+
+### Legal question set
+
+```yaml
+plugins:
+  entries:
+    jev-approvals:
+      settings:
+        question_set: legal          # adds two noul questions to the same request
+        legal_strictness: escalate   # or: policy
+```
+
+`question_set: legal` asks, on the same batched call (~100 extra input tokens):
+
+- **`matter_destructive`** — does the command delete, overwrite, move out of, or
+  irreversibly modify files under a client-matter directory tree?
+- **`client_data_outbound`** — does it transmit client-identifying content or matter
+  material off this machine?
+
+A hit at the question's threshold downgrades the verdict to `ESCALATE` (a model DENY is
+preserved). `legal_strictness` decides whether `approvals.smart_policy` can rescue a hit:
+`escalate` (default) always downgrades; `policy` runs the normal policy branch first, so an
+explicit owner clause ("deleting `work/` scratch under a matter is routine") may approve —
+under the same blast-radius cap the policy branch always carries. Rows scored under the
+legal set carry `policy_version: jev-approval-rules/2-legal` and their own
+`questions_fp`, so they are never pooled with base rows.
+
+### jev-approvals-guard (optional companion, `guard/` dir)
+
+Core's dangerous-command regex flags ~11% of commands and none of the egress shapes a
+legal practice fears (`curl --data @file`, `scp`/`rsync` of client trees, piping files into
+network tools, cloud-storage uploads). The guard is a second, standalone plugin from this
+repo that registers one `pre_tool_call` hook: a terminal command matching a built-in or
+configured egress shape **and** touching a configured matter root
+(`roots`; unset arms everywhere, since the shapes are outbound transfers of local
+content regardless of directory) returns the `approve` directive — which escalates
+the call to the existing human-approval gate. Interactive surfaces get a prompt; smart mode
+gets Jev to review a command core would never have sent it; unattended sessions fail
+closed, per their own `approvals.*_mode`. The guard only ever ADDS gating: no block
+decisions, no rewrites, no bypass path, and a hook that raises or hangs fails closed in the
+runner anyway.
+
+```bash
+hermes plugins install <this-repo>/plugin   # the provider (required)
+hermes plugins install <this-repo>/guard    # the guard (optional)
+```
+
+```yaml
+plugins:
+  entries:
+    jev-approvals-guard:
+      settings:
+        roots: ["~/matter-docs"]   # optional: narrow to your matter trees (local config)
+        # patterns: [{name: my-shape, regex: "..."}]   # extends the built-ins
+```
+
 ## Detailed documentation
+
 
 - [Technical notes, hardening, limitations, and prior art](docs/TECHNICAL.md)
 - [Metrics and methodology](docs/METRICS.md)

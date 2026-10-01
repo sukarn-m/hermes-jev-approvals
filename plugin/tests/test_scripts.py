@@ -13,6 +13,8 @@ PLUGIN = TESTS.parent
 OFFLINE = (
     "test_audit.py",
     "test_boundary.py",
+    "test_fork_settings.py",
+    "test_guard_contract.py",
     "test_hardening.py",
     "test_policy_contract.py",
 )

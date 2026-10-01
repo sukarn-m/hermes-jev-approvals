@@ -1,24 +1,34 @@
 name: jev-approvals
-version: "0.3.0"
+version: "0.4.0"
 # model-provider is required: it is the only kind providers/ discovery imports, and that
 # import is what registers the profile into PROVIDER_REGISTRY (built at hermes_cli.auth
 # import time). A provider registered later — e.g. from register(ctx) under `standalone` —
 # is absent from that registry and resolve_provider_client rejects the name as unknown.
 kind: model-provider
-description: "APPROVALS ONLY. Registers TypeSafe's Jev decision model as a Hermes provider for the single purpose of serving `auxiliary.approval` when `approvals.mode: smart`. Jev returns typed probabilities instead of text, the native shape of the guardian's APPROVE/DENY/ESCALATE question. An original 156-command baseline measured 9.8x lower latency and 4.2x fewer human prompts than one configured aux chat model; this is baseline-specific, not a universal speedup, and the README links an independent v0.2.1 live-sandbox study. TypeSafe and OpenRouter are endpoint presets; any other Jev-compatible HTTPS decision endpoint can be selected with `base_url` plus an optional plugin-level `key_env`; without it, the request itself is anonymous. It registers no hooks and CANNOT generate text, so it refuses any prompt that is not the smart-approval guardian's — never set it as a chat provider or for any other auxiliary task."
+description: "APPROVALS ONLY. Registers TypeSafe's Jev decision model as a Hermes provider for the single purpose of serving `auxiliary.approval` when `approvals.mode: smart`. Jev returns typed probabilities instead of text, the native shape of the guardian's APPROVE/DENY/ESCALATE question. An original 156-command baseline measured 9.8x lower latency and 4.2x fewer human prompts than one configured aux chat model; this is baseline-specific, not a universal speedup, and the README links an independent v0.2.1 live-sandbox study. TypeSafe and OpenRouter are endpoint presets; any other Jev-compatible HTTPS decision endpoint can be selected with `base_url` plus an optional plugin-level `key_env`; without it, the request itself is anonymous. It registers no hooks and CANNOT generate text, so it refuses any prompt that is not the smart-approval guardian's — never set it as a chat provider or for any other auxiliary task. Fork additions: zero-config custom endpoints (a construction-only credential is minted when settings.key_env names the wire-credential variable, so nothing lands in .env), settings-driven decision thresholds, and an optional legal question set (matter deletion / client-data egress) for legal-practice deployments. Companion plugin: jev-approvals-guard (same repo, guard/ dir) widens what reaches the gate."
 author: "anpicasso"
-requires_env:
-  - TYPESAFE_API_KEY
+requires_env: []
 python_dependencies: []
 # Optional. This setting authenticates a custom base_url and is the fallback for a known
 # aggregator whose key Hermes does not already hold in a provider pool. Without it, custom
 # endpoint requests are anonymous and receive no Authorization header. Stock Hermes still
 # requires this api_key provider to have its normal TYPESAFE_API_KEY dispatch credential
-# before it constructs the client; that credential is never forwarded to a custom host.
+# before it constructs the client; when settings.key_env is set the plugin mints a
+# construction-only sentinel for that check automatically (nothing lands in ~/.hermes/.env),
+# and the sentinel is never forwarded to a custom host.
 # `auxiliary.approval.api_key`/`key_env` cannot be used: a key beside `base_url` in task
 # config collapses the provider to "custom" and bypasses this plugin. Leave unset for
 # TypeSafe direct, and for OpenRouter when `hermes auth add openrouter` has been run.
 config_schema:
   key_env:
     type: string
-    description: "Optional environment variable holding the API key sent to a custom Jev decision endpoint; omit it for an anonymous upstream request. For a known aggregator it overrides the preset variable; OpenRouter otherwise uses OPENROUTER_API_KEY."
+    description: "Optional environment variable holding the API key sent to a custom Jev decision endpoint; omit it for an anonymous upstream request. For a known aggregator it overrides the preset variable; OpenRouter otherwise uses OPENROUTER_API_KEY. Setting this also mints a construction-only TYPESAFE_API_KEY sentinel so no placeholder is needed in ~/.hermes/.env."
+  question_set:
+    type: string
+    description: "Optional. 'legal' adds two noul questions to the same request: matter_destructive (deletes/overwrites files under a client-matter tree) and client_data_outbound (transmits matter content off-machine). A hit escalates; see legal_strictness."
+  legal_strictness:
+    type: string
+    description: "With question_set: 'legal' — 'escalate' (default) always downgrades a hit to ESCALATE even when operator_policy covers it; 'policy' lets an explicit policy clause rescue the command under the normal policy_allow blast-radius cap."
+  thresholds:
+    type: object
+    description: "Optional decision-threshold overrides: self_advocating, secrets, policy_allows, confidence, matter_destructive, client_data_outbound in [0,1]; blast_radius, blast_allow in [0,3]. Unknown or out-of-range keys are dropped (falling back to the shipped defaults), never guessed."

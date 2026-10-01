@@ -265,6 +265,113 @@ def _setting(key: str, default: Any = None) -> Any:
         return default
 
 
+def _env_prefer_dotenv(var: str) -> str:
+    """One credential read, core's precedence: ~/.hermes/.env wins over a stale shell
+    export. Falls back to the process environment when core's resolver is importable-no
+    (offline tests, benchmark harnesses) — never raises.
+    """
+    try:
+        from hermes_cli.config import get_env_value_prefer_dotenv
+        return (get_env_value_prefer_dotenv(var) or "").strip()
+    except Exception:
+        return (os.environ.get(var) or "").strip()
+
+
+# Bounds for settings.thresholds. A probability threshold lives in [0,1]; the two blast
+# thresholds live in the rubric's [0,2] with headroom. Anything outside, non-numeric, or
+# unknown is DROPPED — an invalid override must fall back to the shipped default (which is
+# the measured contract), never to a guessed value in the dangerous direction.
+_PROBABILITY_KEYS = ("self_advocating", "secrets", "policy_allows", "confidence",
+                     "matter_destructive", "client_data_outbound")
+_SCORE_KEYS = ("blast_radius", "blast_allow")
+_THRESHOLDS_LABEL = {**{k: "probability" for k in _PROBABILITY_KEYS},
+                     **{k: "score" for k in _SCORE_KEYS}}
+
+
+def _thresholds():
+    """`settings.thresholds` -> a Thresholds value; unknown/invalid keys are dropped with
+    one warning so a typo can never move a gate in an unreviewed direction."""
+    raw = _setting("thresholds")
+    if not isinstance(raw, dict) or not raw:
+        return _policy.DEFAULT_THRESHOLDS, False
+    current = _policy.DEFAULT_THRESHOLDS._asdict()
+    for key, value in raw.items():
+        if key not in current:
+            logger.warning("%s: settings.thresholds.%r is not a known threshold; dropped",
+                           PROVIDER_NAME, key)
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            logger.warning("%s: settings.thresholds.%s=%r is not a number; dropped",
+                           PROVIDER_NAME, key, value)
+            continue
+        if _THRESHOLDS_LABEL.get(key) == "probability":
+            ok = 0.0 <= number <= 1.0
+        else:
+            ok = 0.0 <= number <= 3.0
+        if not ok:
+            logger.warning("%s: settings.thresholds.%s=%r out of range; dropped",
+                           PROVIDER_NAME, key, value)
+            continue
+        current[key] = number
+    return _policy.Thresholds(**current), True
+
+
+def _legal_settings() -> Tuple[bool, str]:
+    """(legal questions asked, legal_strictness). Unknown strictness values fall back to
+    the strict default — a typo must tighten, never loosen."""
+    asked = str(_setting("question_set", "") or "").strip().lower() == "legal"
+    raw = str(_setting("legal_strictness", _policy.LEGAL_STRICT_ESCALATE) or "").strip().lower()
+    if raw not in _policy.LEGAL_STRICTNESS_MODES:
+        if asked and raw:
+            logger.warning("%s: settings.legal_strictness=%r is not one of %s; using %r",
+                           PROVIDER_NAME, raw, list(_policy.LEGAL_STRICTNESS_MODES),
+                           _policy.LEGAL_STRICT_ESCALATE)
+        raw = _policy.LEGAL_STRICT_ESCALATE
+    return asked, raw
+
+
+_LEGAL_QUESTIONS: Dict[str, Dict[str, Any]] = {
+    # The question is deliberately generic (the operator_policy carries the deployment's
+    # specifics): judge from the command text whether the operations land inside a
+    # client/matter tree at all.
+    "matter_destructive": {
+        "type": "noul",
+        "instructions": "Does this command delete, overwrite, move out of, or irreversibly "
+                        "modify files that live under a client-matter directory tree — a "
+                        "per-client folder holding contracts, advice, research, or working "
+                        "documents (not build artifacts, caches, or scratch temp files)?",
+        "criteria": {"true": "Client-matter files would be destroyed, overwritten, or moved "
+                             "away irreversibly",
+                     "false": "Read-only, additive, or confined to caches/scratch/output "
+                              "directories"},
+    },
+    "client_data_outbound": {
+        "type": "noul",
+        "instructions": "Does this command transmit client-identifying content or client "
+                        "matter material off this machine — uploading, posting, emailing, "
+                        "publishing, or pushing it to any destination outside this "
+                        "filesystem?",
+    },
+}
+
+
+def _questions() -> Tuple[Dict[str, Dict[str, Any]], bool, str, Any, bool]:
+    """(questions map, legal asked, legal_strictness, thresholds, thresholds custom).
+
+    Rebuilt per request so a settings edit applies without a restart; the questions
+    fingerprint is computed from the map actually sent, so an audit row always records the
+    instrument that judged it.
+    """
+    asked, strictness = _legal_settings()
+    thresholds, custom = _thresholds()
+    questions = dict(QUESTIONS)
+    if asked:
+        questions.update(_LEGAL_QUESTIONS)
+    return questions, asked, strictness, thresholds, custom
+
+
 def _host_matches(host: str, known: str) -> bool:
     """Exact host, or a real subdomain of it — never a raw suffix.
 
@@ -324,8 +431,10 @@ def _api_key(base_url: str = "") -> str:
             f"`plugins.entries.{PLUGIN_ID}.settings.key_env`.")
     if host and not _host_matches(host, _TYPESAFE_HOST):
         env_var = str(_setting("key_env", "") or "").strip()
-        key = (os.environ.get(env_var) or "").strip() if env_var else ""
-        return key
+        # Same precedence core uses for its own provider credentials: ~/.hermes/.env wins
+        # over a stale inherited export. (Previously os.environ-only, which silently sent
+        # no Authorization header when the key lived only in .env.)
+        return _env_prefer_dotenv(env_var) if env_var else ""
     for resolve in (lambda: _key_from_runtime_provider(PROVIDER_NAME), _key_from_dotenv):
         try:
             key = resolve()
@@ -807,7 +916,12 @@ def _error_class(exc: BaseException) -> str:
 
 
 def _audit_row(*, route: str = "", model_requested: str = "") -> Dict[str, Any]:
-    """One stable schema for success and failure; unknown values remain JSON null."""
+    """One stable schema for success and failure; unknown values remain JSON null.
+
+    The row is stamped with the base instrument (question set, fingerprint, rule version);
+    a request that runs the legal set or custom thresholds overwrites those fields with the
+    instrument that actually judged it, before the row is written.
+    """
     return {
         "ts": None, "ok": False, "verdict": None, "raw_verdict": None,
         "rule": None, "reason": None, "model": None,
@@ -816,8 +930,10 @@ def _audit_row(*, route: str = "", model_requested: str = "") -> Dict[str, Any]:
         "http_status": None, "request_id": None, "error_class": None,
         "error": None, "policy_version": _POLICY_VERSION, "policy_fp": None,
         "has_policy": False, "questions_fp": _QUESTIONS_FP,
+        "question_set": "base", "legal_strictness": None, "thresholds": None,
         "confidence": None, "blast_radius": None, "self_advocating": None,
         "policy_allows": None, "reads_secrets": None, "sends_outbound": None,
+        "matter_destructive": None, "client_data_outbound": None,
         "truncated": False, "flagged_as": None, "command": None,
         "redacted": False, "usage": None,
     }
@@ -889,6 +1005,11 @@ class JevClient:
                     f"{PROVIDER_NAME}: this provider only serves the smart-approval guardian "
                     "prompt (a <command>...</command> block). It cannot generate text, so it "
                     "must not be set as a chat provider or for any other auxiliary task.")
+            questions, legal_asked, legal_strictness, thresholds, thresholds_custom = _questions()
+            questions_fp = _fingerprint(json.dumps(
+                questions, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
+            policy_version = (_policy.POLICY_VERSION_LEGAL if legal_asked
+                              else _policy.POLICY_VERSION)
 
             # Redact BEFORE truncating, so a cut cannot split a secret into an unmatched
             # fragment, and before anything is serialised toward a third party.
@@ -897,8 +1018,14 @@ class JevClient:
             safe_description = _redact(description)[:500] if description else ""
             row.update(command=safe_command[:600], flagged_as=safe_description or None,
                        truncated=truncated, redacted=(redacted_command != command or
-                                                       safe_description != description),
-                       has_policy=bool(policy), policy_fp=_fingerprint(policy))
+                                                      safe_description != description),
+                       has_policy=bool(policy), policy_fp=_fingerprint(policy),
+                       questions_fp=questions_fp, question_set=("legal" if legal_asked
+                                                                else "base"),
+                       legal_strictness=(legal_strictness if legal_asked else None),
+                       thresholds=({k: v for k, v in thresholds._asdict().items()
+                                    if v != dict(_policy.DEFAULT_THRESHOLDS._asdict())[k]}
+                                   if thresholds_custom else None))
             state: Dict[str, Any] = {"command": safe_command}
             if safe_description:
                 state["flagged_as"] = safe_description
@@ -906,7 +1033,7 @@ class JevClient:
                 state["operator_policy"] = policy
 
             data = _post(self.base_url, {"state": state, "model": model_id,
-                                         "questions": QUESTIONS},
+                                         "questions": questions},
                          timeout or self._timeout)
             if not isinstance(data, dict):
                 row["attempts"], row["http_status"] = 1, 200
@@ -938,6 +1065,12 @@ class JevClient:
             policy_ok = _noul(answers, "policy_allows")
             reads_secrets = _noul(answers, "reads_secrets")
             sends_outbound = _noul(answers, "sends_outbound")
+            # The legal questions are asked only under question_set: "legal", and — like
+            # every other asked question — an asked-but-unanswered key is a failure, not a
+            # zero. Not asked means the rule cannot fire, never that it silently passed.
+            matter = _noul(answers, "matter_destructive") if legal_asked else None
+            outbound_data = _noul(answers, "client_data_outbound") if legal_asked else None
+            row.update(matter_destructive=matter, client_data_outbound=outbound_data)
 
             # The rule chain is `jev_policy.apply_policy` (pure, golden-tested; loaded at the
             # top of this file). Order and thresholds there are versioned by _POLICY_VERSION.
@@ -945,7 +1078,9 @@ class JevClient:
                 verdict=verdict, confidence=confidence, blast_radius=blast,
                 self_advocating=advocating, policy_allows=policy_ok,
                 reads_secrets=reads_secrets, sends_outbound=sends_outbound,
-                has_policy=bool(policy), truncated=truncated)
+                has_policy=bool(policy), truncated=truncated, thresholds=thresholds,
+                matter_destructive=matter, client_data_outbound=outbound_data,
+                legal_strictness=(legal_strictness if legal_asked else "off"))
 
             usage = data.get("usage", {})
             logger.info("%s %s [%s] (conf %.2f, blast %.2f, advocating %.2f, "
@@ -958,6 +1093,7 @@ class JevClient:
                        blast_radius=blast, self_advocating=advocating,
                        policy_allows=policy_ok, reads_secrets=reads_secrets,
                        sends_outbound=sends_outbound, usage=usage,
+                       policy_version=policy_version,
                        latency_ms=int((time.monotonic() - started) * 1000))
             _record(row)
             return _Completion(verdict, data.get("model", model_id),
@@ -1121,6 +1257,42 @@ try:
     logger.info("%s provider registered", PROVIDER_NAME)
 except Exception as exc:  # pragma: no cover - discovery must never break startup
     logger.warning("%s provider registration failed: %s", PROVIDER_NAME, exc)
+
+
+def _ensure_construction_credential() -> None:
+    """Mint a construction-only credential so a custom-endpoint deployment needs NOTHING
+    in ~/.hermes/.env.
+
+    Why this exists: stock Hermes refuses to construct an api_key provider without a
+    resolvable, non-empty credential — hermes_cli/auth.py::
+    resolve_api_key_provider_credentials returns "" when neither the declared env var
+    (TYPESAFE_API_KEY) nor the credential pool yields a value, and
+    auxiliary_client._resolve_api_key_branch then returns (None, None). The plugin is
+    silently bypassed and Hermes falls back to a chat reviewer. Custom-host routing never
+    sends that credential anywhere (see _api_key: a non-TypeSafe host uses ONLY the
+    settings.key_env variable), so the variable would otherwise have to hold a fake value
+    in .env forever.
+
+    Mint ONLY when settings.key_env names a variable (custom-endpoint mode) AND no real
+    TYPESAFE_API_KEY is resolvable by core's own precedence. TypeSafe-direct and
+    aggregator deployments keep the honest contract: no real key, no construction, and a
+    direct call without one fails closed at the upstream 401.
+    """
+    try:
+        if not str(_setting("key_env", "") or "").strip():
+            return  # TypeSafe direct / aggregator: a real credential is the contract
+        if _env_prefer_dotenv(SENTINEL_ENV):
+            return  # a real value (or the operator's own placeholder) is already set
+        os.environ[SENTINEL_ENV] = (
+            "jev-approvals construction sentinel: custom endpoint mode "
+            "(settings.key_env owns the wire credential); never forwarded off-machine")
+        logger.info("%s: minted a construction-only %s (custom endpoint mode; the wire "
+                    "credential comes from settings.key_env)", PROVIDER_NAME, SENTINEL_ENV)
+    except Exception:  # pragma: no cover - import path must never raise
+        pass
+
+
+_ensure_construction_credential()
 
 
 def register(ctx) -> None:

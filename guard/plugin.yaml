@@ -1,0 +1,19 @@
+name: jev-approvals-guard
+version: "0.1.0"
+kind: standalone
+description: "Optional companion to jev-approvals: a pre_tool_call guard that widens what reaches the approval gate. Core's regex never flags the egress shapes a legal practice actually fears — `curl --data @contract.pdf https://...`, `scp`/`rsync` of client trees, piping files into network tools — so no reviewer (Jev or chat) is ever consulted about them. This plugin adds those shapes: a match on a terminal command that also touches a configured matter root returns the `approve` directive, which escalates the call to the existing human-approval gate. On interactive surfaces that means a person sees it; in smart mode it means Jev reviews it; in unattended sessions (kanban workers, cron) the human gate fails closed and the command is blocked. It only ever ADDS gating — it cannot waive, skip, or auto-run anything, and it deliberately has no directive that bypasses core."
+author: "anpicasso"
+requires_env: []
+provides_hooks:
+  - pre_tool_call
+python_dependencies: []
+config_schema:
+  enabled:
+    type: boolean
+    description: "Default true. Set false to disable the guard without uninstalling."
+  roots:
+    type: array
+    description: "Directory prefixes (~/-expanded, matching both the ~-literal and expanded spelling) whose presence in the command text arms the guard. Unset or empty arms the guard everywhere (a pattern match alone escalates) - the shipped default."
+  patterns:
+    type: array
+    description: "Optional extra rules, each {name, regex} (Python re syntax, matched case-insensitively against the command text). Extends the built-in egress shapes; a match needs non-empty name and regex, invalid entries are dropped with a warning."
